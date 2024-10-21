@@ -86,6 +86,8 @@ repos:
             test_speechManager/speechManagerTestHarness.py
           )
         )
+    - id: check-illegal-windows-names  # Added hook
+    - id: requirements-txt-fixer  # Added hook
 
 - repo: https://github.com/asottile/add-trailing-comma
   rev: v3.1.0
