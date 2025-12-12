@@ -32,7 +32,7 @@ env:
   # Cache details about available MSVC tooling for subsequent SCons invocations to the provided file.
   SCONS_CACHE_MSVC_CONFIG: ".scons_msvc_cache.json"
   defaultRunner: 'windows-2025'
-  supportedRunners: '["windows-2022", "windows-2025"]'
+  supportedRunners: '["windows-latest", "windows-2025"]'
   defaultArch: x64
   supportedArchitectures: '["x64"]'
   defaultPythonVersion: '3.13.11'
@@ -412,10 +412,10 @@ jobs:
         runner: ${{ fromJson(needs.matrix.outputs.supportedRunners) }}
         arch: ${{ fromJson(needs.matrix.outputs.supportedArchitectures) }}
         pythonVersion: ${{ fromJson(needs.matrix.outputs.supportedPythonVersions) }}
-        # A bug exists with Windows 2022 notepad that prevents NVDA from focusing it.
+        # A bug exists with Windows latest notepad that prevents NVDA from focusing it.
         # This causes our symbol pronunciation tests to fail on this runner.
         exclude:
-          - runner: windows-2022
+          - runner: windows-latest
             testSuite: symbols
     env:
       uv-arch: ${{ matrix.arch == 'x64' && 'x86_64' || 'x86' }}
