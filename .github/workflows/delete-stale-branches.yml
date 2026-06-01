@@ -1,0 +1,311 @@
+name: Delete stale branches
+
+on:
+  schedule:
+    # Run monthly to keep branch maintenance predictable and low risk.
+    - cron: '0 2 1 * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview stale branches without deleting them'
+        type: boolean
+        default: true
+        required: false
+      stale_years:
+        description: 'Optional override for the stale branch threshold in years'
+        type: number
+        required: false
+
+env:
+  STALE_BRANCH_YEARS: ${{ inputs.stale_years || fromJSON(vars.STALE_BRANCH_YEARS) || 3 }}
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  delete-stale-branches:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Delete stale branches
+      id: cleanup
+      uses: actions/github-script@v9
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require("fs");
+
+          const dryRun = context.eventName === "workflow_dispatch"
+          	? `${context.payload.inputs?.dry_run ?? "true"}` === "true"
+          	: false;
+          const staleYearsRaw = process.env.STALE_BRANCH_YEARS;
+          const staleYears = Number(staleYearsRaw);
+
+          if (!Number.isFinite(staleYears) || staleYears <= 0) {
+          	core.setFailed(`Expected stale_years to be a positive number, got: ${staleYearsRaw}`);
+          	return;
+          }
+
+          const { owner, repo } = context.repo;
+          const defaultBranch = context.payload.repository.default_branch;
+          const preservedBranches = new Set([defaultBranch, "master", "beta", "rc"]);
+          const cutoffDate = new Date();
+          cutoffDate.setUTCFullYear(cutoffDate.getUTCFullYear() - staleYears);
+
+          const branches = await github.paginate(github.rest.repos.listBranches, {
+          	owner,
+          	repo,
+          	per_page: 100,
+          });
+          const openPullRequests = await github.paginate(github.rest.pulls.list, {
+          	owner,
+          	repo,
+          	state: "open",
+          	per_page: 100,
+          });
+          const openPullRequestBranches = new Set(
+          	openPullRequests
+          		.filter((pullRequest) => pullRequest.head?.repo?.full_name === `${owner}/${repo}`)
+          		.map((pullRequest) => pullRequest.head.ref),
+          );
+
+          /** @type {Array<{name: string, reason: string, timestamp?: string}>} */
+          const skippedBranches = [];
+          /** @type {Map<string, number>} */
+          const skippedReasonCounts = new Map();
+          /** @type {Array<{name: string, timestamp: string}>} */
+          const staleBranches = [];
+          /** @type {Array<{name: string, timestamp: string}>} */
+          const deletedBranches = [];
+
+          /**
+           * @param {string} name
+           * @param {string} reason
+           * @param {string | undefined} timestamp
+           * @param {boolean} includeInDetailedLogs
+           */
+          function recordSkip(name, reason, timestamp, includeInDetailedLogs = true) {
+          	skippedReasonCounts.set(reason, (skippedReasonCounts.get(reason) ?? 0) + 1);
+          	if (includeInDetailedLogs) {
+          		skippedBranches.push({name, reason, timestamp});
+          	}
+          }
+
+          for (const branch of branches) {
+          	if (preservedBranches.has(branch.name)) {
+          		recordSkip(branch.name, "preserved branch");
+          		continue;
+          	}
+
+          	if (branch.name.startsWith("release-")) {
+          		recordSkip(branch.name, "release branch");
+          		continue;
+          	}
+
+          	if (branch.protected) {
+          		recordSkip(branch.name, "protected branch");
+          		continue;
+          	}
+
+          	if (openPullRequestBranches.has(branch.name)) {
+          		recordSkip(branch.name, "open pull request");
+          		continue;
+          	}
+
+          	const commitResponse = await github.rest.repos.getCommit({
+          		owner,
+          		repo,
+          		ref: branch.commit.sha,
+          	});
+          	const commitDate = commitResponse.data.commit.committer?.date ?? commitResponse.data.commit.author?.date;
+
+          	if (!commitDate) {
+          		recordSkip(branch.name, "missing commit timestamp");
+          		continue;
+          	}
+
+          	const branchDate = new Date(commitDate);
+          	if (Number.isNaN(branchDate.getTime())) {
+          		recordSkip(branch.name, "invalid commit timestamp", commitDate);
+          		continue;
+          	}
+
+          	if (branchDate >= cutoffDate) {
+          		recordSkip(branch.name, "not stale", commitDate, false);
+          		continue;
+          	}
+
+          	staleBranches.push({name: branch.name, timestamp: commitDate});
+          	if (dryRun) {
+          		continue;
+          	}
+
+          	await github.rest.git.deleteRef({
+          		owner,
+          		repo,
+          		ref: `heads/${branch.name}`,
+          	});
+          	deletedBranches.push({name: branch.name, timestamp: commitDate});
+          }
+
+          core.info(
+          	[
+          		`Checked ${branches.length} branches.`,
+          		`Cutoff date: ${cutoffDate.toISOString()}.`,
+          		`Dry run: ${dryRun}.`,
+          		`Stale branches found: ${staleBranches.length}.`,
+          		`Branches deleted: ${deletedBranches.length}.`,
+          	].join(" "),
+          );
+
+          for (const branch of skippedBranches) {
+          	core.info(
+          		`Skipped ${branch.name}: ${branch.reason}${branch.timestamp ? ` (${branch.timestamp})` : ""}`,
+          	);
+          }
+
+          for (const branch of staleBranches) {
+          	core.info(
+          		`${dryRun ? "Would delete" : "Deleted"} ${branch.name} (${branch.timestamp})`,
+          	);
+          }
+
+          const skippedCount = Array.from(skippedReasonCounts.values()).reduce((sum, count) => sum + count, 0);
+          const skipCounts = Array.from(skippedReasonCounts.entries())
+          	.sort(([leftReason], [rightReason]) => leftReason.localeCompare(rightReason));
+
+          /**
+           * @param {string} value
+           * @returns {string}
+           */
+          function escapeHtml(value) {
+          	return String(value)
+          		.replaceAll("&", "&amp;")
+          		.replaceAll("<", "&lt;")
+          		.replaceAll(">", "&gt;")
+          		.replaceAll('"', "&quot;")
+          		.replaceAll("'", "&#39;");
+          }
+
+          const deletionRows = staleBranches.length > 0
+          	? staleBranches.map(
+          		(branch) => `
+          			<tr>
+          				<td>${escapeHtml(branch.name)}</td>
+          				<td>${escapeHtml(dryRun ? "Would delete" : "Deleted")}</td>
+          				<td>${escapeHtml(branch.timestamp)}</td>
+          			</tr>`,
+          	).join("")
+          	: `
+          		<tr>
+          			<td colspan="3">No stale branches matched the cleanup criteria.</td>
+          		</tr>`;
+          const skipCountRows = skipCounts.length > 0
+          	? skipCounts.map(
+          		([reason, count]) => `
+          			<tr>
+          				<td>${escapeHtml(reason)}</td>
+          				<td>${escapeHtml(String(count))}</td>
+          			</tr>`,
+          	).join("")
+          	: `
+          		<tr>
+          			<td colspan="2">No branches were skipped.</td>
+          		</tr>`;
+          const reportHtml = `<!DOCTYPE html>
+          <html lang="en">
+          <head>
+          	<meta charset="utf-8">
+          	<title>Stale branch cleanup report</title>
+          	<style>
+          		body { font-family: Arial, sans-serif; margin: 24px; color: #24292f; }
+          		h1, h2 { margin-bottom: 12px; }
+          		table { border-collapse: collapse; width: 100%; margin-bottom: 24px; }
+          		th, td { border: 1px solid #d0d7de; padding: 8px 10px; text-align: left; vertical-align: top; }
+          		th { background: #f6f8fa; }
+          		code { font-family: Consolas, monospace; }
+          	</style>
+          </head>
+          <body>
+          	<h1>Stale branch cleanup report</h1>
+          	<p>Repository: <code>${escapeHtml(`${owner}/${repo}`)}</code></p>
+          	<p>Run ID: <code>${escapeHtml(String(context.runId))}</code></p>
+          	<p>Generated at: <code>${escapeHtml(new Date().toISOString())}</code></p>
+          	<h2>Summary</h2>
+          	<table>
+          		<thead>
+          			<tr><th>Setting</th><th>Value</th></tr>
+          		</thead>
+          		<tbody>
+          			<tr><td>Dry run</td><td>${escapeHtml(String(dryRun))}</td></tr>
+          			<tr><td>Stale threshold (years)</td><td>${escapeHtml(String(staleYears))}</td></tr>
+          			<tr><td>Cutoff date</td><td>${escapeHtml(cutoffDate.toISOString())}</td></tr>
+          			<tr><td>Branches checked</td><td>${escapeHtml(String(branches.length))}</td></tr>
+          			<tr><td>Branches skipped</td><td>${escapeHtml(String(skippedCount))}</td></tr>
+          			<tr><td>Stale branches found</td><td>${escapeHtml(String(staleBranches.length))}</td></tr>
+          			<tr><td>Branches deleted</td><td>${escapeHtml(String(deletedBranches.length))}</td></tr>
+          		</tbody>
+          	</table>
+          	<h2>${escapeHtml(dryRun ? "Branches that would be deleted" : "Deleted branches")}</h2>
+          	<table>
+          		<thead>
+          			<tr><th>Branch</th><th>Action</th><th>Latest commit timestamp</th></tr>
+          		</thead>
+          		<tbody>${deletionRows}</tbody>
+          	</table>
+          	<h2>Skip counts</h2>
+          	<table>
+          		<thead>
+          			<tr><th>Reason</th><th>Count</th></tr>
+          		</thead>
+          		<tbody>${skipCountRows}</tbody>
+          	</table>
+          </body>
+          </html>`;
+          fs.writeFileSync("stale-branch-cleanup-report.html", reportHtml, "utf8");
+          core.info("Wrote stale-branch-cleanup-report.html");
+
+          await core.summary
+          	.addHeading("Stale branch cleanup")
+          	.addTable([
+          		[
+          			{data: "Setting", header: true},
+          			{data: "Value", header: true},
+          		],
+          		["Dry run", String(dryRun)],
+          		["Stale threshold (years)", String(staleYears)],
+          		["Cutoff date", cutoffDate.toISOString()],
+          		["Branches checked", String(branches.length)],
+          		["Branches skipped", String(skippedCount)],
+          		["Stale branches found", String(staleBranches.length)],
+          		["Branches deleted", String(deletedBranches.length)],
+          	]);
+
+          if (skippedReasonCounts.size > 0) {
+          	await core.summary
+          		.addHeading("Skip counts", 2)
+          		.addTable([
+          			[
+          				{data: "Reason", header: true},
+          				{data: "Count", header: true},
+          			],
+          			...Array.from(skippedReasonCounts.entries())
+          				.sort(([leftReason], [rightReason]) => leftReason.localeCompare(rightReason))
+          				.map(([reason, count]) => [reason, String(count)]),
+          		]);
+          }
+
+          if (staleBranches.length > 0) {
+          	await core.summary.addHeading(dryRun ? "Branches that would be deleted" : "Deleted branches", 2);
+          	for (const branch of staleBranches) {
+          		await core.summary.addRaw(`- \`${branch.name}\` (${branch.timestamp})`).addEOL();
+          	}
+          }
+
+          await core.summary.write();
+    - name: Upload cleanup report
+      uses: actions/upload-artifact@v4
+      with:
+        name: stale-branch-cleanup-report-${{ github.run_id }}
+        path: stale-branch-cleanup-report.html
+        if-no-files-found: error
