@@ -44,8 +44,10 @@ jobs:
         # Keep in sync with defaultPythonVersion in testAndPublish.yml.
         python-version: '3.13.13'
     - name: Install the latest version of uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@v10.0.1
       with:
+        prune-cache: true
+        cache-suffix: test-v10
         activate-environment: "false"
     # Autofix role: run the fixer hooks (the "autofix" group) and push the fixes.
     - name: Apply prek auto-fixes
